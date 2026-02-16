@@ -1,0 +1,9 @@
+[package]
+name = "file-vec"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memmap2 = "0.9"
+page_size = "0.6"
+rand = "0.9"
