@@ -389,6 +389,18 @@ impl<E> FileVec<E>{
 		file.set_len((mem::size_of::<E>()*newcapacity).try_into().unwrap()).unwrap();
 		unsafe{self.map=Some(MmapMut::map_mut(&file).unwrap())}
 	}
+	/// resize
+	pub fn resize(&mut self,len:usize,val:E) where E:Clone{
+		if len<self.len{return self.truncate(len)}else if len==self.len{return};
+
+		self.extend((self.len..len-1).map(|_|val.clone()));
+		self.push(val);
+	}
+	/// resize
+	pub fn resize_with<F:FnMut()->E>(&mut self,len:usize,mut f:F){
+		if len<self.len{return self.truncate(len)}else if len==self.len{return};
+		self.extend((self.len..len).map(|_|f()))
+	}
 	/// remove all items for which the function returns false
 	pub fn retain<F:FnMut(&mut E)->bool>(&mut self,mut f:F){
 		let l=self.len;
