@@ -4,7 +4,7 @@ impl<'a,E,F:FnMut(&mut E)->bool> Drop for ExtractIf<'a,E,F>{
 			let (pr,pw)=(self.pr,self.pw);
 			let (qr,qw)=(self.qr,self.qw);
 			let items=self.items;
-			let len=self.len.as_mut().unwrap_unchecked();
+			let len=self.len;
 														// compute gap lengths and total items removed by the difference between the read and write pointers
 			let (pg,qg)=(pr.offset_from(pw) as usize,qw.offset_from(qr) as usize);
 			let remaining=qr.offset_from(pr) as usize;
@@ -215,24 +215,23 @@ impl<'a,E> Drop for Drain<'a,E>{
 		unsafe{											// bounds were checked on construction for soundness, and presumably remained sound
 			let (start,stop)=(self.start,self.stop);
 			if start==stop{return}						// no need to do anything with an empty range. This usually works implicitly; the explicit edge case is needed when the results of keep_rest aren't compatible with the normal drop process. In this situation, the keep_rest function handles the drop and sets start=stop.
-
-			let items=self.items;
-			let len=self.len.as_mut().unwrap_unchecked();
-			let pstart=items.add(start);
-			let pstop= items.add(stop);
-														// drop remaining items in the range
+														// finalize by copy items after the range to fill the gap, then adjust the length
+			let finalize=FinalizeDrop::new(||{
+				let (items,len)=(self.items,self.len);
+														// the tail (items after removal range) are copied so it starts where the removal range started
+				ptr::copy(items.add(stop),items.add(start),*len-stop);
+				*len-=stop-start;
+			});
 			if mem::needs_drop::<E>(){
 				let mut p=self.p;
 				let     q=self.q;
-
+														// drop remaining items in the range if needed
 				while p<q{
 					ptr::drop_in_place(p);
 					p=p.add(1);
 				}
-			}											// copy items after the range to fill the gap
-			ptr::copy(pstop,pstart,*len-stop);
-														// adjust len
-			*len-=stop-start;
+			}											// finalize
+			mem::drop(finalize);
 		}
 	}
 }
@@ -273,17 +272,17 @@ impl<'a,E> Iterator for Drain<'a,E>{
 
 #[derive(Debug)]
 /// file vec drain structure
-pub struct Drain<'a,E>{items:*mut E,len:*mut usize,marker:PhantomData<&'a E>,p:*mut E,q:*mut E,start:usize,stop:usize}
+pub struct Drain<'a,E>{items:*mut E,len:*mut usize,marker:PhantomData<&'a mut FileVec<E>>,p:*mut E,q:*mut E,start:usize,stop:usize}
 #[derive(Debug)]
 /// file vec extract if structure
-pub struct ExtractIf<'a,E,F:FnMut(&mut E)->bool>{f:F,items:*mut E,len:*mut usize,marker:PhantomData<&'a E>,pr:*mut E,pw:*mut E,qr:*mut E,qw:*mut E}
+pub struct ExtractIf<'a,E,F:FnMut(&mut E)->bool>{f:F,items:*mut E,len:*mut usize,marker:PhantomData<&'a mut FileVec<E>>,pr:*mut E,pw:*mut E,qr:*mut E,qw:*mut E}
 
 unsafe impl<'a,E:Send,F:FnMut(&mut E)->bool+Send> Send for ExtractIf<'a,E,F>{}
 unsafe impl<'a,E:Send> Send for Drain<'a,E>{}
 unsafe impl<'a,E:Sync,F:FnMut(&mut E)->bool+Sync> Sync for ExtractIf<'a,E,F>{}
 unsafe impl<'a,E:Sync> Sync for Drain<'a,E>{}
 
-use crate::FileVec;
+use crate::{FileVec,FinalizeDrop};
 use std::{
 	borrow::{Borrow,BorrowMut},iter::FusedIterator,marker::PhantomData,mem,ops::{Bound,Deref,DerefMut,RangeBounds},ptr,slice
 };

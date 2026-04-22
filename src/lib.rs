@@ -1,3 +1,13 @@
+impl<F:FnOnce()> Drop for FinalizeDrop<F>{
+	fn drop(&mut self){
+		unsafe{self.0.assume_init_read()()}
+	}
+}
+impl<F:FnOnce()> FinalizeDrop<F>{
+	/// create a new drop finalizer from the function
+	pub fn new(inner:F)->Self{Self(MaybeUninit::new(inner))}
+}
+
 #[cfg(test)]
 mod tests{
 	#[test]
@@ -153,6 +163,46 @@ mod tests{
 		assert_eq!(v.as_slice(),[5,4,3,1,-4,-6]);
 	}
 	#[test]
+	fn insert_remove(){
+		let mut v=FileVec::from([0,1,2,3,4,5,6,7,8,9]);
+
+		v.insert(10,-9);
+		v.insert( 9,-8);
+		v.insert( 3,-2);
+
+		v.insert( 9,-7);
+		v.insert( 8,-6);
+		v.insert( 7,-5);
+		v.insert( 6,-4);
+		v.insert( 5,-3);
+		//v.insert( 3,-2);
+		v.insert( 2,-1);
+		v.insert( 1, 0);
+		v.insert( 0, 1);
+
+		assert_eq!(v.as_slice(),[1,0,0,1,-1,2,-2,3,-3,4,-4,5,-5,6,-6,7,-7,8,-8,9,-9]);
+
+		assert_eq!(v.remove(0),1);
+		assert_eq!(v.remove(1),0);
+		assert_eq!(v.remove(1),1);
+		assert_eq!(v.remove(2),2);
+		assert_eq!(v.remove(9),6);
+
+		assert_eq!(v.remove(3),3);
+		assert_eq!(v.remove(4),4);
+		assert_eq!(v.remove(5),5);
+		//assert_eq!(v.remove(6),6);
+		assert_eq!(v.remove(7),7);
+		assert_eq!(v.remove(8),8);
+		assert_eq!(v.remove(9),9);
+
+		assert_eq!(v.as_slice(),[0,-1,-2,-3,-4,-5,-6,-7,-8,-9]);
+		assert_eq!(v.remove(9),-9);
+		assert_eq!(v.remove(8),-8);
+		assert_eq!(v.remove(7),-7);
+		assert_eq!(v.remove(6),-6);
+	}
+	#[test]
 	fn load_persist(){
 		let mut v=FileVec::new();
 
@@ -224,11 +274,23 @@ mod tests{
 
 		assert_eq!([0_i32;0],v.as_slice());
 	}
+	#[test]
+	fn retain(){
+		let mut v=FileVec::new();
+		v.extend_from_slice(&[5,4,3,2,1,0,-2,-4,-6,3,3,3]);
+
+		v.retain(|x|*x%2==0);
+		assert_eq!(v.as_slice(),[4,2,0,-2,-4,-6]);
+	}
 
 	use std::{mem,path::PathBuf,sync::Arc};
 	use super::*;
 }
+/// helper struct for running function tail code that is required for drop soundness even if a panic occurs
+pub (crate) struct FinalizeDrop<F:FnOnce()>(MaybeUninit<F>);
+
 pub mod iter;
 pub mod vec;
 
 pub use vec::FileVec;
+use std::mem::MaybeUninit;

@@ -11,17 +11,23 @@ impl<E:Clone> Clone for FileVec<E>{
 		self.extend_from_slice(other);
 	}
 }
+impl<E:Clone> From<&[E]> for FileVec<E>{
+	fn from(slice:&[E])->Self{slice.iter().cloned().collect()}
+}
 impl<E,const N:usize> FileVec<[E;N]>{
 	/// flatten FileVec<[E;N]> to FileVec<E>
 	pub fn into_flattened(mut self)->FileVec<E>{
 		FileVec{
-			len:self.len.checked_mul(N).unwrap(),
+			len:mem::take(&mut self.len).checked_mul(N).unwrap(),
 			map:self.map.take(),
 			path:self.path.take(),
-			persistent:self.persistent,
+			persistent:mem::take(&mut self.persistent),
 			phantom:PhantomData
 		}
 	}
+}
+impl<E,const N:usize> From<[E;N]> for FileVec<E>{
+	fn from(slice:[E;N])->Self{slice.into_iter().collect()}
 }
 impl<E> AsMut<[E]> for FileVec<E>{
 	fn as_mut(&mut self)->&mut [E]{self.as_mut_slice()}
@@ -70,7 +76,8 @@ impl<E> Extend<E> for FileVec<E>{
 																	// if first iteration or capacity matches length, set the pointer to the end of the length in the current allocation
 				cap=self.capacity();
 				p=self.as_mut_ptr().add(self.len);
-			}														// write the item to the end of the length, then increment length and pointer
+			}
+																	// write the item to the end of the length, then increment length and pointer
 			ptr::write(p,x);
 			p=p.add(1);
 			self.len+=1;
@@ -84,7 +91,7 @@ impl<E> FileVec<E>{
 	pub fn append(&mut self,other:&mut Self){
 		assert_ne!(self.as_mut_ptr(),other.as_mut_ptr());
 		self.reserve(other.len);
-									// the base pointers are different if the file vec was initialized correctly, so i'd assume the files don't overlap so they shouldn't overlap in the memory map
+											// the base pointers are different if the file vec was initialized correctly, so i'd assume the files don't overlap so they shouldn't overlap in the memory map
 		unsafe{ptr::copy_nonoverlapping(other.as_mut_ptr() as *const E,self.as_mut_ptr().add(self.len),other.len)}
 		self.len+=other.len;
 		other.len=0;
@@ -127,7 +134,7 @@ impl<E> FileVec<E>{
 	pub fn clear(&mut self){
 		if mem::needs_drop::<E>(){
 			let p=self.as_mut_ptr();
-			while self.len>0{					// file vec keeps data initialized up to len
+			while self.len>0{				// file vec keeps data initialized up to len
 				self.len-=1;
 				unsafe{ptr::drop_in_place(p.add(self.len))}
 			}
@@ -155,26 +162,43 @@ impl<E> FileVec<E>{
 	pub fn dedup(&mut self) where E:PartialEq{self.dedup_by(|x,y|x==y)}
 	/// remove adjacent duplicates according to the same bucket function
 	pub fn dedup_by<F:FnMut(&mut E,&mut E)->bool>(&mut self,mut f:F){
-		let l=self.len;
-		if l==0{return}
-										// create read and write pointers
-		let mut r=self.as_mut_ptr();
-		let mut w=r;
-										// refill with deduplicated items. the read pointer stays at or ahead of the write pointer
-		self.len=1;
-		for _n in 1..l{
-			unsafe{
-				let mut item=ptr::read(r.add(1));
-				let previous=r.as_mut().unwrap_unchecked();
-
-				if !f(&mut item,previous){
-					ptr::write(w.add(1),item);
-					self.len+=1;		// TODO recounting the length like this does prevent undefined behavior due to drop panics, but converts that behavior instead to a potential memory leak, which is not ideal if the program continues running on another thread
-					w=w.add(1);
+		let remaining=Cell::new(self.len);
+		if remaining.get()<=1{return}else{remaining.update(|r|r-1)}
+										// create new length counter and read and write pointers
+		let l:Cell<usize> =Cell::new(1);// a pointer to index 1 is valid because len is greater than 1. Otherwise the function would have returned early 2 lines ago
+		let r:Cell<*mut E>=Cell::new(unsafe{self.as_mut_ptr().add(1)});
+		let w:Cell<*mut E>=Cell::new(r.get());
+										// finalize by updating moving remaining items if any, then updating self.len to reflect the new length
+		let finalize=FinalizeDrop::new(||unsafe{
+			let remainder=remaining.get();
+			if remainder>0{				// if comparison or drop panic, move the rest of the array as if no further duplicates
+				ptr::copy(r.get(),w.get(),remainder);
+				l.update(|l|l+remainder);
+			}
+			self.len=l.get();
+		});								// refill with deduplicated items. the read pointer stays at or ahead of the write pointer
+		while remaining.get()>0{
+			unsafe{						// extract references to current and previous items
+				let current=&mut *r.get();
+				let previous=&mut *r.get().sub(1);
+										// check if duplicate
+				let f=f(current,previous);
+										// update r after f but before drop to ensure even in case of f panic or drop panic, the current item is removed if and only if f returns true
+				r.update(|r|r.add(1));
+				remaining.update(|r|r-1);
+										// if f is true, drop the current item, otherwise, move it to the current write position
+				if f{
+					ptr::drop_in_place(r.get());
+				}else{
+					ptr::copy(current,w.get(),1);
+										// update new length and write pointer after moving
+					l.update(|l|l+1);
+					w.update(|w|w.add(1));
 				}
-				r=r.add(1);
 			}
 		}
+										// finalize
+		mem::drop(finalize);
 	}
 	/// dedup by key
 	pub fn dedup_by_key<F:FnMut(&mut E)->K,K:PartialEq>(&mut self,mut f:F){self.dedup_by(|x,y|f(x)==f(y))}
@@ -191,11 +215,12 @@ impl<E> FileVec<E>{
 		for _ in 0..l{
 			unsafe{
 				ptr::write(p,s.as_ref().unwrap_unchecked().clone());
+				self.len+=1;
+										// increment pointers after writing
 				p=p.add(1);
 				s=s.add(1);
 			}
 		}
-		self.len+=l;
 	}
 	/// clone a range of items onto the end. Panics if start>stop or either start or stop is greater than self.len()
 	pub fn extend_from_within<R:RangeBounds<usize>>(&mut self,range:R) where E:Clone{
@@ -225,21 +250,24 @@ impl<E> FileVec<E>{
 		for _ in 0..stop-start{
 			unsafe{
 				ptr::write(p,s.as_ref().unwrap_unchecked().clone());
+				self.len+=1;
+														// increment pointers after writing
 				p=p.add(1);
 				s=s.add(1);
 			}
 		}
-		self.len+=stop-start;
 	}
 	/// removes and yields items from the range where f is true. if the iterator is not exhausted, the remaining items will be left in the collection
 	pub fn extract_if<R:RangeBounds<usize>,F:FnMut(&mut E)->bool>(&mut self,r:R,f:F)->ExtractIf<'_,E,F>{ExtractIf::new(self,r,f)}
+	/// Creates a FileVec<T> where each element is produced by calling f with that element’s index while walking forward through the FileVec<T>
+	pub fn from_fn<F:FnMut(usize)->E>(length:usize,f:F)->Self{(0..length).map(f).collect()}
 	/// insert the item at the index, shifting all items after it
 	pub fn insert(&mut self,index:usize,item:E){
-		let _=self.insert_mut(index,item);
+		self.insert_mut(index,item);
 	}
 	/// insert the item at the index, shifting all items after it
 	pub fn insert_mut(&mut self,index:usize,item:E)->&mut E{
-		assert!(index<self.len);
+		assert!(index<=self.len);
 		self.reserve(1);
 		unsafe{											// index is in bounds and should have at least one space available to copy to
 			let p=self.as_mut_ptr().add(index);
@@ -256,10 +284,10 @@ impl<E> FileVec<E>{
 		self.truncate(self.len-self.len%N);
 
 		FileVec{
-			len:self.len/N,
+			len:mem::take(&mut self.len)/N,
 			map:self.map.take(),
 			path:self.path.take(),
-			persistent:self.persistent,
+			persistent:mem::take(&mut self.persistent),
 			phantom:PhantomData
 		}
 	}
@@ -272,6 +300,7 @@ impl<E> FileVec<E>{
 	/// creates new file vec. The file won't be created and the vec won't allocate until items are added to it
 	pub fn new()->Self{
 		assert_eq!(page_size::get()%mem::align_of::<E>(),0);
+		assert_ne!(mem::size_of::<E>(),0);
 
 		Self{
 			len:0,
@@ -323,6 +352,20 @@ impl<E> FileVec<E>{
 			p.as_mut().unwrap_unchecked()
 		}
 	}
+	/// push an item onto the file vec
+	pub fn push_within_capacity(&mut self,item:E)->Result<&mut E,E>{
+		if self.len()<self.capacity(){
+			Ok(unsafe{
+				let p=self.as_mut_ptr().add(self.len);
+				ptr::write(p,item);
+
+				self.len+=1;
+				p.as_mut().unwrap_unchecked()
+			})
+		}else{
+			Err(item)
+		}
+	}
 	/// remove and return the item at the index and shift elements after it down 1
 	pub fn remove(&mut self,index:usize)->E{
 		let l=self.len;
@@ -339,38 +382,7 @@ impl<E> FileVec<E>{
 	}
 	/// remove and drop a range of items. Panics if start>stop or either start or stop is greater than self.len()
 	pub fn remove_range<R:RangeBounds<usize>>(&mut self,range:R){
-		let begin=range.start_bound();
-		let end=range.end_bound();
-		let start=match begin{							// normalize bounds
-			Bound::Excluded(&n)=>n.saturating_add(1),
-			Bound::Included(&n)=>n,
-			Bound::Unbounded   =>0
-		};
-		let stop= match end{
-			Bound::Excluded(&n)=>n,
-			Bound::Included(&n)=>n.saturating_add(1),
-			Bound::Unbounded   =>self.len
-		};
-														// bounds check
-		assert!(start<=self.len);
-		assert!(start<=stop);
-		assert!(stop <=self.len);
-														// bounds were checked for soundness
-		unsafe{
-			let items=self.as_mut_ptr();
-			let pstart=items.add(start);
-			let pstop= items.add(stop);
-														// drop items in the range
-			if mem::needs_drop::<E>(){
-				let mut p=pstart;
-				while p<pstop{
-					ptr::drop_in_place(p);
-					p=p.add(1);
-				}
-			}											// copy items after the range to fill the gap
-			ptr::copy(pstop,pstart,self.len-stop);
-		}												// adjust len
-		self.len-=stop-start;
+		Drain::new(self,range);
 	}
 	/// reserves capacity for at least additional more items in the backing file
 	pub fn reserve(&mut self,additional:usize){
@@ -378,6 +390,23 @@ impl<E> FileVec<E>{
 		assert!(required<isize::MAX as usize);
 														// check if necessary and compute next capacity
 		let newcapacity=if required<=self.capacity(){return}else{required.next_power_of_two()};
+		if self.path.is_none(){							// generate a path if not allocated yet
+			let uid:u64=rand::random();
+			self.path=Some(format!(".file-vec_{uid:x}").into());
+		}
+														// unmap and reopen the file
+		self.map=None;
+		let file=OpenOptions::new().create(true).read(true).write(true).open(self.path.as_ref().unwrap()).unwrap();
+														// extend file length and remap
+		file.set_len((mem::size_of::<E>()*newcapacity).try_into().unwrap()).unwrap();
+		unsafe{self.map=Some(MmapMut::map_mut(&file).unwrap())}
+	}
+	/// reserves capacity for at least additional more items in the backing file
+	pub fn reserve_exect(&mut self,additional:usize){
+		let required=additional.saturating_add(self.len());
+		assert!(required<isize::MAX as usize);
+														// check if necessary and compute next capacity
+		let newcapacity=if required<=self.capacity(){return}else{required};
 		if self.path.is_none(){							// generate a path if not allocated yet
 			let uid:u64=rand::random();
 			self.path=Some(format!(".file-vec_{uid:x}").into());
@@ -402,28 +431,89 @@ impl<E> FileVec<E>{
 		self.extend((self.len..len).map(|_|f()))
 	}
 	/// remove all items for which the function returns false
-	pub fn retain<F:FnMut(&mut E)->bool>(&mut self,mut f:F){
-		let l=self.len;
-		let mut w=self.as_mut_ptr();
-		let mut r=w;
-
-		self.len=0;
-		for _ in 0..l{
-			unsafe{
-				let mut item=ptr::read(r);
-
-				if f(&mut item){
-					ptr::write(w,item);
-					self.len+=1;
-					w=w.add(1);
+	pub fn retain<F:FnMut(&E)->bool>(&mut self,mut f:F){self.retain_mut(|x|f(x))}
+	/// remove all items for which the function returns false
+	pub fn retain_mut<F:FnMut(&mut E)->bool>(&mut self,mut f:F){
+		let remaining=Cell::new(self.len);
+		if remaining.get()==0{return}
+										// create new length counter and read and write pointers
+		let l:Cell<usize> =Cell::new(0);
+		let r:Cell<*mut E>=Cell::new(self.as_mut_ptr());
+		let w:Cell<*mut E>=Cell::new(r.get());
+										// finalize by updating moving remaining items if any, then updating self.len to reflect the new length
+		let finalize=FinalizeDrop::new(||unsafe{
+			let remainder=remaining.get();
+			if remainder>0{				// if comparison or drop panic, move the rest of the array as if no further removals
+				ptr::copy(r.get(),w.get(),remainder);
+				l.update(|l|l+remainder);
+			}
+			self.len=l.get();
+		});								// refill with retained items. the read pointer stays at or ahead of the write pointer
+		while remaining.get()>0{
+			unsafe{						// extract references to current item and check if retained
+				let current=&mut *r.get();
+				let f=f(current);
+										// update r after f but before drop to ensure even in case of f panic or drop panic, the current item is removed if and only if f returns false
+				r.update(|r|r.add(1));
+				remaining.update(|r|r-1);
+										// if f is true, drop the current item, otherwise, move it to the current write position
+				if f{
+					ptr::copy(current,w.get(),1);
+										// update new length and write pointer after moving
+					l.update(|l|l+1);
+					w.update(|w|w.add(1));
+				}else{
+					ptr::drop_in_place(r.get());
 				}
-				r=r.add(1);
 			}
 		}
+										// finalize
+		mem::drop(finalize);
 	}
 	/// sets whether the backing file should persist after the vec is dropped. Technically the file just existing doesn't cause any soundness problems, so this isn't marked as unsafe, but it probably shouldn't be set true on types requiring drop if the intent is to open the file in a new file vec later. Default value is usually false, except it's true for FileVec created by opening an existing file
 	pub fn set_persistent(&mut self,persistent:bool){self.persistent=persistent}
-	/// shorted the FileVec length to n if it's longer, dropping the extra
+	/// shrinks the capacity of the vector with a lower bound
+	pub fn shrink_to(&mut self,mut mincap:usize){
+		if mincap>=self.capacity(){return}
+		if mincap<self.len{mincap=self.len}
+											// get file path and unmap so we can edit the file through the file system
+		let path=if let Some(p)=self.path.take(){p}else{return};
+		self.map=None;
+											// trim the file to length
+		let file=OpenOptions::new().create(true).write(true).open(&path).unwrap();
+		file.set_len((mem::size_of::<E>()*mincap).try_into().unwrap()).unwrap();
+											// remap
+		self.path=Some(path);
+		unsafe{self.map=Some(MmapMut::map_mut(&file).unwrap())}
+	}
+	/// Shrinks the capacity of the vector as much as possible.
+	pub fn shrink_to_fit(&mut self){self.shrink_to(self.len)}
+	/// Returns the remaining spare capacity of the vector as a slice of MaybeUninit<E>
+	pub fn spare_capacity_mut(&mut self)->&mut [MaybeUninit<E>]{self.split_at_spare_mut().1}
+	/// Returns vector content as a slice of T, along with the remaining spare capacity of the vector as a slice of MaybeUninit<T>.
+	pub fn split_at_spare_mut(&mut self)->(&mut [E],&mut [MaybeUninit<E>]){
+		let bytes:&mut [u8]=if let Some(m)=&mut self.map{m}else{return (&mut [],&mut [])};
+		let items=unsafe{					// this should be okay if the file vec was created correctly and nothing modifed the file data
+			bytes.align_to_mut::<MaybeUninit<E>>()
+		};
+											// mmap should align to os page size which should work for anything. assert just in case
+		assert_eq!(items.0.len(),0);
+		assert_eq!(items.2.len(),0);
+
+		unsafe{								// the items up to len are initialized
+			mem::transmute(items.1.split_at_mut(self.len))
+		}
+	}
+	/// split the collection in two at the given index
+	pub fn split_off(&mut self,a:usize)->Self{self.drain(a..).collect()}
+	/// returns the item at this index, replacing it with the last item
+	pub fn swap_remove(&mut self,index:usize)->E{
+		assert!(index<self.len);
+
+		let last=self.pop().unwrap();
+		mem::replace(&mut self[index],last)
+	}
+	/// shorten the FileVec length to n if it's longer, dropping the extra
 	pub fn truncate(&mut self,n:usize){
 		if mem::needs_drop::<E>(){
 			unsafe{
@@ -437,9 +527,17 @@ impl<E> FileVec<E>{
 			self.len=self.len.min(n);
 		}
 	}
+	/// create a file vec with at least an initial capacity
+	pub fn with_capacity(cap:usize)->Self{
+		let mut result=Self::new();
+
+		result.reserve(cap);
+		result
+	}
 	/// opens a file as a FileVec. The bytes in the file must be valid when interpreted as [T], the file should not be modified while in use, and the file must not be open in any other file vec or other memory mapping. An empty file will be created when the file vec allocates if the file doesn't exist. Regardless of whether the file already existed, the FileVec's persistence flag will be initialized to true
 	pub unsafe fn open<P:AsRef<Path>>(path:P)->IOResult<Self>{
 		assert_eq!(page_size::get()%mem::align_of::<E>(),0);
+		assert_ne!(mem::size_of::<E>(),0);
 
 		let path:PathBuf=path.as_ref().into();
 		let persistent=true;
@@ -463,6 +561,10 @@ impl<E> FileVec<E>{
 	pub unsafe fn set_len(&mut self,len:usize){self.len=len}
 	/// sets the path to store the data in. The old file will be deleted unless the persistence flag is true. If data is already in the file, it will be copied to the file at the new path. If the new path points to an existing file it will be overwritten. The file should not be modified while in use, and the file must not be open in any other file vec or other memory mapping.
 	pub unsafe fn set_path<P:AsRef<Path>>(&mut self,path:P)->IOResult<()>{
+		if let Some(p)=self.path(){
+			if p==path.as_ref(){return Ok(())}
+		}
+
 		let old=self.path.clone();
 		let persistent=self.is_persistent();
 											// close the file and leave it in the file system so we can copy it
@@ -480,12 +582,23 @@ impl<E> FileVec<E>{
 		Ok(())
 	}
 }
+impl<E> FromIterator<E> for FileVec<E>{
+	fn from_iter<I:IntoIterator<Item=E>>(collection:I)->Self{
+		let mut result=Self::new();
+
+		result.extend(collection);
+		result
+	}
+}
+
 #[derive(Debug)]
 /// memory maps a file into a vec like structure. Avoid modifying the backing file while the file vec is living. Item alignment must be a factor of os page size. Cloning will copy the file. ZST currently not supported
 pub struct FileVec<E>{len:usize,map:Option<MmapMut>,path:Option<PathBuf>,persistent:bool,phantom:PhantomData<E>}
 
-use crate::iter::{Drain,ExtractIf};
+use crate::{
+	FinalizeDrop,iter::{Drain,ExtractIf}
+};
 use memmap2::MmapMut;
 use std::{
-	borrow::{Borrow,BorrowMut},cmp::PartialEq,fs::{OpenOptions,self},io::{ErrorKind as IOErrorKind,Result as IOResult},marker::PhantomData,mem::{MaybeUninit,self},ops::{Bound,Deref,DerefMut,RangeBounds},path::{PathBuf,Path},ptr
+	borrow::{Borrow,BorrowMut},cell::Cell,cmp::PartialEq,fs::{OpenOptions,self},io::{ErrorKind as IOErrorKind,Result as IOResult},iter::FromIterator,marker::PhantomData,mem::{MaybeUninit,self},ops::{Bound,Deref,DerefMut,RangeBounds},path::{PathBuf,Path},ptr
 };
