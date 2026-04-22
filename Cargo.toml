@@ -1,9 +1,14 @@
 [package]
-name = "file-vec"
-version = "0.1.0"
+authors = ["Aili Nierengarten <aili.nierengarten@gmail.com>"]
+description = "Uses memory mapping to store a vec like structure in the file system rather than on the heap. Although diskalloc already exists, I needed the option to make data persistent so an opaque allocator structure was inadequate for me. This reimplements most of Vec's features, with a couple extra stuff for relating to the backing file"
+documentation = "https://docs.rs/file-vec"
 edition = "2024"
+name = "file-vec"
+license = "MIT"
+version = "0.1.0"
+repository = "https://github.com/8000thCube/file-vec"
 
 [dependencies]
 memmap2 = "0.9"
 page_size = "0.6"
-rand = "0.9"
+rand = "0.10"
