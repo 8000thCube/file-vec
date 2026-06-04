@@ -5,10 +5,20 @@ documentation = "https://docs.rs/file-vec"
 edition = "2024"
 name = "file-vec"
 license = "MIT"
-version = "0.1.0"
+version = "0.2.0"
 repository = "https://github.com/8000thCube/file-vec"
 
 [dependencies]
+#bytemuck = "1"
 memmap2 = "0.9"
 page_size = "0.6"
 rand = "0.10"
+rmp-serde = { version = "1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+serial-custom = []
+serial-json = ["serde_json","serde"]
+serial-rmp = ["rmp-serde","serde"]
