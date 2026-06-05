@@ -10,6 +10,126 @@ impl<F:FnOnce()> FinalizeDrop<F>{
 
 #[cfg(test)]
 mod tests{
+	#[cfg(feature="serial-json")]
+	mod json_tests{
+		#[test]
+		fn close_save_load(){
+			let names=["Kyon","Kyouma","Dita","Umika","Roger","Kobato","Kate","Lucy","Lain","Sasami"];
+
+			let mut data:FileVec<Record>=(0..10).map(|n|{
+				let id=n as u64+1;
+				let measure=rand::random();
+				let name=names[n].to_string();
+
+				Record{id,measure,name}
+			}).collect();
+			let datamem:Vec<Record>=data.to_vec();
+			let datapath=data.path().unwrap().to_path_buf();
+
+			data.serialize_on_close(crate::vec::SerialJson::new(false));
+
+			mem::drop(data);
+			let mut datanew:FileVec<Record>=FileVec::new();
+
+			datanew.serialize_on_close(crate::vec::SerialJson::new(false));
+			datanew.set_persistent(false);
+
+			datanew.load(datapath).unwrap();
+
+			assert_eq!(datamem.as_slice(),datanew.as_slice());
+		}
+		#[test]
+		fn use_another_path(){
+			let names=["Kyon","Kyouma","Dita","Umika","Roger","Kobato","Kate","Lucy","Lain","Sasami"];
+
+			let mut data:FileVec<Record>=(0..10).map(|n|{
+				let id=n as u64+1;
+				let measure=rand::random();
+				let name=names[n].to_string();
+
+				Record{id,measure,name}
+			}).collect();
+			let datamem:Vec<Record>=data.to_vec();
+
+			data.serialize_on_close(crate::vec::SerialJson::new(false));
+			data.set_close_behavior(OnClose::serialize("another path"));
+
+			mem::drop(data);
+			let mut datanew:FileVec<Record>=FileVec::new();
+
+			datanew.serialize_on_close(crate::vec::SerialJson::new(false));
+			datanew.set_persistent(false);
+
+			datanew.load("another path").unwrap();
+
+			assert_eq!(datamem.as_slice(),datanew.as_slice());
+		}
+
+		#[derive(Clone,Debug,Deserialize,PartialEq,Serialize)]
+		pub struct Record{pub id:u64,pub measure:f32,pub name:String}
+
+		use crate::vec::OnClose;
+		use serde::{Deserialize,Serialize};
+		use super::*;
+	}
+	#[cfg(feature="serial-rmp")]
+	mod rmp_tests{
+		#[test]
+		fn close_save_load(){
+			let names=["Kyon","Kyouma","Dita","Umika","Roger","Kobato","Kate","Lucy","Lain","Sasami"];
+
+			let mut data:FileVec<Record>=(0..10).map(|n|{
+				let id=n as u64+1;
+				let measure=rand::random();
+				let name=names[n].to_string();
+
+				Record{id,measure,name}
+			}).collect();
+			let datamem:Vec<Record>=data.to_vec();
+			let datapath=data.path().unwrap().to_path_buf();
+
+			data.enable_serialization();
+			data.set_close_behavior(OnClose::Serialize(None));
+
+			mem::drop(data);
+
+			let mut datanew:FileVec<Record>=FileVec::new();
+			datanew.enable_serialization();
+
+			datanew.load(datapath).unwrap();
+
+			assert_eq!(datamem.as_slice(),datanew.as_slice());
+		}
+
+		#[derive(Clone,Debug,Deserialize,PartialEq,Serialize)]
+		pub struct Record{pub id:u64,pub measure:f32,pub name:String}
+
+		use crate::vec::OnClose;
+		use serde::{Deserialize,Serialize};
+		use super::*;
+	}
+
+	/*#[test]
+	fn hhh(){
+		use std::fs::File;
+		use std::io::Write;
+
+
+		let mut v = FileVec::new();
+		let a = v.insert_mut(0, String::from("hello world"));
+
+		for n in 0..100{
+			v.push(String::new());
+		}
+
+		// get the right file name tho
+		let mut file = File::open(v.path().unwrap()).unwrap();
+		file.write(b"garbage").unwrap();
+
+		if v.len()==1{
+			println!("{}", v[0]);
+		}
+	}*/
 	#[test]
 	fn close_drop(){
 		let data=[Arc::new(1),Arc::new(2),Arc::new(3),Arc::new(4),Arc::new(5)];
@@ -102,7 +222,7 @@ mod tests{
 		assert_eq!(v.drain(1..2).as_slice(),[1]);
 		assert_eq!([2,4],v.as_slice());
 
-		assert_eq!(v.drain(1..1).as_slice(),[]);
+		assert_eq!(v.drain(1..1).as_slice(),[0_i32;0]);
 		assert_eq!([2,4],v.as_slice());
 
 		v.push(6);

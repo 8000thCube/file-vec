@@ -1,5 +1,9 @@
 fn generate_path()->PathBuf{format!(".file-vec_{:x}",rand::random::<u64>()).into()}
 
+impl OnClose{
+	/// construct a closebehavior of serialize from a path ref
+	pub fn serialize<P:AsRef<Path>>(path:P)->Self{Self::Serialize(path.as_ref().to_path_buf().into())}
+}
 impl<E:Clone> Clone for FileVec<E>{
 	fn clone(&self)->Self{
 		let mut result=FileVec::new();
@@ -19,7 +23,7 @@ impl<E:Clone> From<&[E]> for FileVec<E>{
 	fn from(slice:&[E])->Self{slice.iter().cloned().collect()}
 }
 impl<E,const N:usize> FileVec<[E;N]>{
-	/// flatten FileVec<[E;N]> to FileVec<E>
+	/// flatten FileVec<[E;N]> to FileVec<E>. if the close behavior is serialize, note that this does not preserve serial behavior
 	pub fn into_flattened(mut self)->FileVec<E>{
 		//if mem::size_of::<E>()==0{return FileVec::zst(self.len,self.path())}
 		if self.buffer.is_none(){return FileVec::new()}
@@ -30,7 +34,7 @@ impl<E,const N:usize> FileVec<[E;N]>{
 		self.close();
 		let mut result=unsafe{FileVec::open(path).unwrap()};
 
-		#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]{
+		/*#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]{
 			result.serialbehavior=self.serialbehavior.take().map(|b|unsafe{
 				let b:ComponentSB<Arc<dyn SerialBehavior<[E;N],BufReader<File>,BufWriter<File>>>,N>=ComponentSB(b);
 				let a:Arc<dyn SerialBehavior<E,BufReader<File>,BufWriter<File>>>=Arc::new(b);
@@ -40,7 +44,7 @@ impl<E,const N:usize> FileVec<[E;N]>{
 
 				Arc::from_raw(p)
 			});
-		}
+		}*/
 
 		result.closebehavior=closebehavior;
 		result
@@ -320,10 +324,13 @@ impl<E> FileVec<E>{
 	pub fn dedup_by_key<F:FnMut(&mut E)->K,K:PartialEq>(&mut self,mut f:F){self.dedup_by(|x,y|f(x)==f(y))}
 	/// drain a range of items. Panics if start>stop or either start or stop is greater than self.len()
 	pub fn drain<R:RangeBounds<usize>>(&mut self,range:R)->Drain<'_,E>{Drain::new(self,range)}
-	#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
-	/// enable serialization and set the serial behavior. use serialize_on_close to also set the close behavior to serialize without having to set_close_behavior afterward
-	pub fn enable_serialization<B:'static+SerialBehavior<E,BufReader<File>,BufWriter<File>>>(&mut self,behavior:B){
-		self.serialbehavior=Some(Arc::new(behavior))
+	#[cfg(any(feature="serial-json",feature="serial-rmp"))]
+	/// enable serialization and set the serial behavior depending on the feature. if multiple serial features are enabled, use serialize_on_close for finer control over exactly what serial behavior to use. Note that this does not set the close behavior, but serialize_on_close does
+	pub fn enable_serialization(&mut self) where E:DeserializeOwned+Serialize{
+		#[cfg(feature="serial-json")]
+		{self.serialbehavior=Some(Arc::new(SerialJson::new(true)))}
+		#[cfg(feature="serial-rmp")]
+		{self.serialbehavior=Some(Arc::new(SerialRMP::new()))}
 	}
 	/// pushes clones of all the items in the slice onto the file vec
 	pub fn extend_from_slice(&mut self,slice:&[E]) where E:Clone{
@@ -402,7 +409,7 @@ impl<E> FileVec<E>{
 			p.as_mut().unwrap_unchecked()
 		}
 	}
-	/// groups every N items into chunks, dropping the remainder
+	/// groups every N items into chunks, dropping the remainder. if the close behavior is serialize, note that this does not preserve serial behavior
 	pub fn into_chunks<const N:usize>(mut self)->FileVec<[E;N]>{
 		self.truncate(self.len-self.len%N);
 
@@ -415,7 +422,7 @@ impl<E> FileVec<E>{
 		self.close();
 		let mut result=unsafe{FileVec::open(path).unwrap()};
 
-		#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]{
+		/*#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]{
 			result.serialbehavior=self.serialbehavior.take().map(|b|unsafe{
 				let b:ArraySB<Arc<dyn SerialBehavior<E,BufReader<File>,BufWriter<File>>>>=ArraySB(b);
 				let a:Arc<dyn SerialBehavior<[E;N],BufReader<File>,BufWriter<File>>>=Arc::new(b);
@@ -425,7 +432,7 @@ impl<E> FileVec<E>{
 
 				Arc::from_raw(p)
 			});
-		}
+		}*/
 
 		result.closebehavior=closebehavior;
 		result
@@ -439,6 +446,24 @@ impl<E> FileVec<E>{
 	}
 	/// returns the length of the file vec
 	pub fn len(&self)->usize{self.len}
+	#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
+	/// use the enabled serialization to load from a file
+	pub fn load<P:AsRef<Path>>(&mut self,path:P)->IOResult<()> where E:Debug{
+		use std::io::{BufRead,ErrorKind as IOErrorKind};
+		let serialbehavior=if let Some(s)=self.serialbehavior.clone(){s}else{return Err(IOError::other("serial behavior not set"))};
+
+		let file=OpenOptions::new().read(true).open(path).unwrap();
+		let mut reader=BufReader::new(file);
+
+		Ok(while reader.buffer().len()>0||reader.fill_buf()?.len()>0{
+			let b=serialbehavior.load(&mut reader);
+			if let Err(b)=&b&&b.kind()==IOErrorKind::UnexpectedEof{		// hack to make json thing work
+				if reader.buffer().len()==0&&reader.fill_buf()?.len()==0{break}
+			}
+
+			self.push(b?);
+		})
+	}
 	/// allow len adjustment from other files in the crate
 	pub (crate) unsafe fn len_mut(&mut self)->&mut usize{&mut self.len}
 	/// creates new file vec. The file won't be created and the vec won't allocate until items are added to it
@@ -618,8 +643,8 @@ impl<E> FileVec<E>{
 	#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
 	/// enable serialization, set the close behavior to serialize and set the serial behavior
 	pub fn serialize_on_close<B:'static+SerialBehavior<E,BufReader<File>,BufWriter<File>>>(&mut self,behavior:B){
-		self.enable_serialization(behavior);
-		self.set_close_behavior(OnClose::Serialize(None))
+		self.serialbehavior=Some(Arc::new(behavior));
+		self.set_close_behavior(OnClose::Serialize(None));
 	}
 	/// set the close behavior
 	pub fn set_close_behavior(&mut self,closebehavior:OnClose){self.closebehavior=closebehavior}
@@ -736,11 +761,6 @@ pub struct SerialRMP;
 
 #[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
 mod serial_adapters{
-	#[derive(Clone,Debug,Default)]
-	pub struct ArraySB<B>(pub B);
-	#[derive(Clone,Debug,Default)]
-	pub struct ComponentSB<B,const N:usize>(pub B);
-
 	#[cfg(feature="serial-json")]
 	impl SerialJson{
 		/// create a new serialization behavior that uses serde-json
@@ -748,142 +768,61 @@ mod serial_adapters{
 			Self{pretty}
 		}
 	}
-	#[cfg(feature="serial-json")]
+	#[cfg(feature="serial-rmp")]
 	impl SerialRMP{
 		/// create a new serialization behavior that uses rmp-serde
 		pub fn new()->Self{Self}
 	}
-	impl<B:SerialBehavior<E,R,W>,E,R,W,const N:usize> SerialBehavior<[E;N],R,W> for ArraySB<B>{
-		fn load(&self,reader:&mut R)->IOResult<[E;N]>{
-			unsafe{
-				let mut array:MaybeUninit<[E;N]>=MaybeUninit::uninit();
-				let arraymut:&mut [MaybeUninit<E>;N]=mem::transmute(&mut array);
-
-				let l=self.0.load_slice(reader,arraymut)?.len();
-				if l!=N{
-					for n in 0..l{arraymut[n].assume_init_drop()}
-					return Err(IOError::other("Incorrect stream length"))
-				}
-
-				Ok(array.assume_init())
-			}
-		}
-		unsafe fn load_components(&self,reader:&mut R,slice:&mut [MaybeUninit<<[E;N] as ArrayLike>::E>])->IOResult<&mut [<[E;N] as ArrayLike>::E]>{
-			unsafe{self.0.load_slice(reader,slice)}
-		}
-		fn save(&self,data:&[E;N],writer:&mut W)->IOResult<()>{
-			Ok(for e in data{self.0.save(e,writer)?})
-		}
-		fn save_components(&self,data:&[<[E;N] as ArrayLike>::E],writer:&mut W)->IOResult<()>{
-			Ok(for e in data{self.0.save(e,writer)?})
-		}
-	}
-	impl<B:SerialBehavior<[E;N],R,W>,E,R,W,const N:usize> SerialBehavior<E,R,W> for ComponentSB<B,N>{
-		fn load(&self,reader:&mut R)->IOResult<E>{
-			unsafe{
-				let mut array:MaybeUninit<E>=MaybeUninit::uninit();
-				let arraymut:&mut [MaybeUninit<E>;1]=mem::transmute(&mut array);
-
-				let l=self.0.load_components(reader,arraymut)?.len();
-				if l!=1{
-					for n in 0..l{arraymut[n].assume_init_drop()}
-					return Err(IOError::other("Incorrect stream length"))
-				}
-
-				Ok(array.assume_init())
-			}
-		}
-		fn save(&self,data:&E,writer:&mut W)->IOResult<()>{self.0.save_components(slice::from_ref(data),writer)}
-	}
 	#[cfg(feature="serial-json")]
 	impl<E:DeserializeOwned+Serialize,R:Read,W:Write> SerialBehavior<E,R,W> for SerialJson{
-		fn load(&self,reader:&mut R)->IOResult<E>{Ok(json_decode::from_reader(reader)?)}
+		fn load(&self        ,reader:&mut R)->IOResult<E >{
+			use std::io::ErrorKind as IOErrorKind;
+			//Ok(json_decode::from_reader(&mut *reader)?)
+
+			let mut e=serde_json::Deserializer::from_reader(reader).into_iter::<E>();
+			e.next().ok_or_else(||IOError::new(IOErrorKind::UnexpectedEof,"stream should have data at this point but no items are found")).and_then(|e|Ok(e?))
+		}
 		fn save(&self,data:&E,writer:&mut W)->IOResult<()>{
-			Ok(if self.pretty{json_encode::to_writer_pretty(writer,data)?}else{json_encode::to_writer(writer,data)?})
+			if self.pretty{json_encode::to_writer_pretty(&mut *writer,data)?}else{json_encode::to_writer(&mut *writer,data)?}
+			writeln!(writer)
 		}
 	}
 	#[cfg(feature="serial-rmp")]
 	impl<E:DeserializeOwned+Serialize,R:Read,W:Write> SerialBehavior<E,R,W> for SerialRMP{
-		fn load(&self,reader:&mut R)->IOResult<E>{Ok(rmp_decode::from_read(reader).map_err(IOError::other)?)}
-		fn save(&self,data:&E,writer:&mut W)->IOResult<()>{rmp_encode::write(writer,data).map_err(IOError::other)}
+		fn load(&self         ,reader:&mut R)->IOResult<E >{Ok(rmp_decode::from_read(reader       ).map_err(IOError::other)?)}
+		fn save(&self,data:& E,writer:&mut W)->IOResult<()>{Ok(rmp_encode::write(&mut *writer,data).map_err(IOError::other)?)}
 	}
 	impl<E,R,W> SerialBehavior<E,R,W> for Arc<dyn SerialBehavior<E,R,W>>{
-		fn load(&self,reader:&mut R)->IOResult<E>{(**self).load(reader)}
-		unsafe fn load_components(&self,reader:&mut R,slice:&mut [MaybeUninit<<E as ArrayLike>::E>])->IOResult<&mut [<E as ArrayLike>::E]> where E:ArrayLike{
-			unsafe{(**self).load_components(reader,slice)}
-		}
-		unsafe fn load_slice(&self,reader:&mut R,slice:&mut [MaybeUninit<E>])->IOResult<&mut [E]>{
-			unsafe{(**self).load_slice(reader,slice)}
-		}
+		fn load(&self        ,reader:&mut R)->IOResult< E>{(**self).load(     reader)}
 		fn save(&self,data:&E,writer:&mut W)->IOResult<()>{(**self).save(data,writer)}
-		fn save_components(&self,data:&[<E as ArrayLike>::E],writer:&mut W)->IOResult<()> where E:ArrayLike{(**self).save_components(data,writer)}
-	}
-	impl<E,const N:usize> ArrayLike for [E;N]{
-		type E=E;
-	}
-
-	/// trait level detection of arrays
-	pub trait ArrayLike{
-		/// slice component type
-		type E;
 	}
 	/// serialization behavior to apply when enabling serialization
-	pub trait SerialBehavior<E,R,W>:Debug{
-		/// deserialization behavior to apply when loading a file
-		fn load(&self,reader:&mut R)->IOResult<E>;
-		/// optional operation to load where E is a slice. overrides must maintain the unsafe invariant that the components of the returned subslice are all initialized by this function
-		unsafe fn load_components(&self,reader:&mut R,slice:&mut [MaybeUninit<<E as ArrayLike>::E>])->IOResult<&mut [<E as ArrayLike>::E]> where E:ArrayLike{
-			let _=(reader,slice);
-			unimplemented!()
-		}
-		/// helper operation to load a slice of E. don't override.
-		unsafe fn load_slice(&self,reader:&mut R,slice:&mut [MaybeUninit<E>])->IOResult<&mut [E]>{
-			let mut n=0;
-			let result=loop{
-				if n==slice.len(){break Ok(())}
-				match self.load(reader){
-					Err(e)=>break Err(e),
-					Ok(x) =>slice[n]=MaybeUninit::new(x)
-				}
-				n+=1;
-			};
-
-			if let Err(e)=result{
-				for n in 0..n{	// should be initialized up to n
-					unsafe{slice[n].assume_init_drop()}
-				}
-				return Err(e)
-			}					// n should have reached slice.len in this case
-			Ok(unsafe{mem::transmute(slice)})
-		}
-		/// serialization behavior to apply when saving a file
+	pub trait SerialBehavior<E,R,W>:Debug+Send+Sync{
+		/// deserialization behavior to apply when loading
+		fn load(&self        ,reader:&mut R)->IOResult<E >;
+		/// serialization behavior to apply when saving
 		fn save(&self,data:&E,writer:&mut W)->IOResult<()>;
-		/// optional operation to save a slice of components
-		fn save_components(&self,data:&[<E as ArrayLike>::E],writer:&mut W)->IOResult<()> where E:ArrayLike{// TODO this strategy is problematic. making the chunks thing work out might work better with mutable self and internal buffer
-			let _=(data,writer);
-			unimplemented!()
-		}
 	}
-
-	use std::{io::Error as IOError,slice};
 	use super::*;
 }
 #[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
-pub use serial_adapters::{ArraySB,ArrayLike,ComponentSB,SerialBehavior};
+pub use serial_adapters::SerialBehavior;
 
 use crate::{
 	FinalizeDrop,iter::{Drain,ExtractIf}
 };
 use memmap2::MmapMut;
 #[cfg(feature="serial-json")]
-use serde_json::{de as json_decode,ser as json_encode};
+use serde_json::ser as json_encode;
 #[cfg(feature="serial-rmp")]
 use rmp_serde::{decode as rmp_decode,encode as rmp_encode};
 #[cfg(any(feature="serial-json",feature="serial-rmp"))]
 use serde::{Serialize,de::DeserializeOwned};
+#[cfg(any(feature="serial-json",feature="serial-rmp"))]
+use std::io::{Read,Write};
 #[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
 use std::{
-	fs::File,io::{BufReader,BufWriter,Read,Write},sync::Arc
+	fs::File,io::{BufReader,BufWriter,Error as IOError},sync::Arc
 };
 use std::{
 	borrow::{Borrow,BorrowMut},cell::Cell,cmp::PartialEq,fmt::Debug,fs::{OpenOptions,self},io::{Result as IOResult},iter::FromIterator,marker::PhantomData,mem::{MaybeUninit,self},ops::{Bound,Deref,DerefMut,RangeBounds},path::{PathBuf,Path},ptr
