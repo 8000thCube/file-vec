@@ -1,8 +1,26 @@
 fn generate_path()->PathBuf{format!(".file-vec_{:x}",rand::random::<u64>()).into()}
 
 impl OnClose{
+	/// construct a close behavior of delete
+	pub fn delete()->Self{Self::Delete}
+	/// construct a close behavior of persist
+	pub fn persist()->Self{Self::Persist}
+	/// construct a close behavior of serialize
+	pub fn serialize()->Self{Self::Serialize(None)}
 	/// construct a closebehavior of serialize from a path ref
-	pub fn serialize<P:AsRef<Path>>(path:P)->Self{Self::Serialize(path.as_ref().to_path_buf().into())}
+	pub fn serialize_to<P:AsRef<Path>>(path:P)->Self{Self::Serialize(path.as_ref().to_path_buf().into())}
+}
+#[cfg(feature="serial-json")]
+impl SerialJson{
+	/// create a new serialization behavior that uses serde-json
+	pub fn new(pretty:bool)->Self{
+		Self{pretty}
+	}
+}
+#[cfg(feature="serial-rmp")]
+impl SerialRMP{
+	/// create a new serialization behavior that uses rmp-serde
+	pub fn new()->Self{Self}
 }
 impl<E:Clone> Clone for FileVec<E>{
 	fn clone(&self)->Self{
@@ -21,6 +39,30 @@ impl<E:Clone> Clone for FileVec<E>{
 }
 impl<E:Clone> From<&[E]> for FileVec<E>{
 	fn from(slice:&[E])->Self{slice.iter().cloned().collect()}
+}
+#[cfg(feature="serial-json")]
+impl<E:DeserializeOwned+Serialize,R:Read,W:Write> SerialBehavior<E,R,W> for SerialJson{
+	fn load(&self        ,reader:&mut R)->IOResult<E >{
+		use std::io::ErrorKind as IOErrorKind;
+		//Ok(json_decode::from_reader(&mut *reader)?)
+
+		let mut e=serde_json::Deserializer::from_reader(reader).into_iter::<E>();
+		e.next().ok_or_else(||IOError::new(IOErrorKind::UnexpectedEof,"stream should have data at this point but no items are found")).and_then(|e|Ok(e?))
+	}
+	fn save(&self,data:&E,writer:&mut W)->IOResult<()>{
+		if self.pretty{json_encode::to_writer_pretty(&mut *writer,data)?}else{json_encode::to_writer(&mut *writer,data)?}
+		writeln!(writer)
+	}
+}
+#[cfg(feature="serial-rmp")]
+impl<E:DeserializeOwned+Serialize,R:Read,W:Write> SerialBehavior<E,R,W> for SerialRMP{
+	fn load(&self         ,reader:&mut R)->IOResult<E >{Ok(rmp_decode::from_read(reader       ).map_err(IOError::other)?)}
+	fn save(&self,data:& E,writer:&mut W)->IOResult<()>{Ok(rmp_encode::write(&mut *writer,data).map_err(IOError::other)?)}
+}
+#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
+impl<E,R,W> SerialBehavior<E,R,W> for Arc<dyn SerialBehavior<E,R,W>>{
+	fn load(&self        ,reader:&mut R)->IOResult< E>{(**self).load(     reader)}
+	fn save(&self,data:&E,writer:&mut W)->IOResult<()>{(**self).save(data,writer)}
 }
 impl<E,const N:usize> FileVec<[E;N]>{
 	/// flatten FileVec<[E;N]> to FileVec<E>. if the close behavior is serialize, note that this does not preserve serial behavior
@@ -325,12 +367,14 @@ impl<E> FileVec<E>{
 	/// drain a range of items. Panics if start>stop or either start or stop is greater than self.len()
 	pub fn drain<R:RangeBounds<usize>>(&mut self,range:R)->Drain<'_,E>{Drain::new(self,range)}
 	#[cfg(any(feature="serial-json",feature="serial-rmp"))]
-	/// enable serialization and set the serial behavior depending on the feature. if multiple serial features are enabled, use serialize_on_close for finer control over exactly what serial behavior to use. Note that this does not set the close behavior, but serialize_on_close does
+	/// enable serialization and set the serial behavior depending on the feature, the sets the close behavior to serialize. if multiple serial features are enabled, use serialize_on_close for finer control over exactly what serial behavior to use
 	pub fn enable_serialization(&mut self) where E:DeserializeOwned+Serialize{
 		#[cfg(feature="serial-json")]
 		{self.serialbehavior=Some(Arc::new(SerialJson::new(true)))}
 		#[cfg(feature="serial-rmp")]
 		{self.serialbehavior=Some(Arc::new(SerialRMP::new()))}
+
+		self.closebehavior=OnClose::Serialize(None)
 	}
 	/// pushes clones of all the items in the slice onto the file vec
 	pub fn extend_from_slice(&mut self,slice:&[E]) where E:Clone{
@@ -440,9 +484,9 @@ impl<E> FileVec<E>{
 	/// checks if empty
 	pub fn is_empty(&self)->bool{self.len==0}
 	/// set the len to 0 and reset the path without calling drop on the components.
-	pub fn leak(&mut self){
-		self.buffer=None;
+	pub fn leak_file(&mut self)->Option<PathBuf>{
 		self.len=0;
+		self.buffer.take().map(|x|x.path)
 	}
 	/// returns the length of the file vec
 	pub fn len(&self)->usize{self.len}
@@ -466,7 +510,7 @@ impl<E> FileVec<E>{
 	}
 	/// allow len adjustment from other files in the crate
 	pub (crate) unsafe fn len_mut(&mut self)->&mut usize{&mut self.len}
-	/// creates new file vec. The file won't be created and the vec won't allocate until items are added to it
+	/// creates new file vec. The close behavior is initialized to Delete. The file won't be created and the vec won't allocate until items are added to it
 	pub fn new()->Self{
 		assert_eq!(page_size::get()%mem::align_of::<E>(),0);
 		assert_ne!(mem::size_of::<E>(),0);
@@ -479,7 +523,7 @@ impl<E> FileVec<E>{
 			serialbehavior:None
 		}
 	}
-	/// opens a file as a FileVec. The bytes in the file must be valid when interpreted as [T], the file should not be modified while in use, and the file must not be open in any other file vec or other memory mapping. An empty file will be created when the file vec allocates if the file doesn't exist. Regardless of whether the file already existed, the FileVec's persistence flag will be initialized to true
+	/// opens a file as a FileVec with the close behavior set to Persist. The data in the file must be valid when transmuted to the component type. This function is difficult to use safely on non-POD component types, but if you must, avoid use after free, and ensure layout matches if the file persists between program versions. Additionally, the caller must ensure no living FileVec have paths leading to the same file. Modifying or removing the file while the FileVec is open as doing so would be undefined behavior, however, due to OS level file locking, that type of problem is unlikely to occur.
 	pub unsafe fn open<P:AsRef<Path>>(path:P)->IOResult<Self>{
 		assert_eq!(page_size::get()%mem::align_of::<E>(),0);
 		assert_ne!(mem::size_of::<E>(),0);
@@ -495,6 +539,15 @@ impl<E> FileVec<E>{
 			#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
 			serialbehavior:None
 		})
+	}
+	#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
+	/// open data serialized on close safely by deserialization. to avoid interfering with the serialized file, a new file will be opened to store the deserialized memory mapped values
+	pub fn open_serial<B:'static+SerialBehavior<E,BufReader<File>,BufWriter<File>>,P:AsRef<Path>>(path:P,serialbehavior:B)->IOResult<Self>{
+		let mut this=Self::new();
+		this.set_serial_behavior(serialbehavior);
+
+		this.load(path)?;
+		this
 	}
 	/// references the file path. returns none if the vec is new and empty and hasn't created a file yet
 	pub fn path(&self)->Option<&Path>{
@@ -669,6 +722,9 @@ impl<E> FileVec<E>{
 			Ok(())
 		}
 	}
+	#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
+	/// set the serial behavior without setting the close behavior
+	pub fn set_serial_behavior<B:'static+SerialBehavior<E,BufReader<File>,BufWriter<File>>>(&mut self,behavior:B){self.serialbehavior=Some(Arc::new(behavior))}
 	/// shrinks the capacity of the vector with a lower bound
 	pub fn shrink_to(&mut self,mut mincap:usize){
 		if mincap>=self.capacity(){return}
@@ -728,7 +784,7 @@ impl<E> FromIterator<E> for FileVec<E>{
 }
 
 #[derive(Debug)]
-/// memory maps a file into a vec like structure. Avoid modifying the backing file while the file vec is living. Item alignment must be a factor of os page size. Cloning will copy the file. ZST currently not supported
+/// memory maps a file into a vec like structure. Avoid modifying the backing file while the file vec is living. Item alignment must be a factor of os page size. ZST currently not supported
 pub struct FileVec<E>{
 	buffer:Option<Buffer<E>>,
 	len:usize,
@@ -742,11 +798,11 @@ struct Buffer<E>{map:MmapMut,path:PathBuf,phantom:PhantomData<E>}
 #[derive(Clone,Debug,Default)]
 /// Enumerate the file vec close behavior. When closed or dropped...
 pub enum OnClose{
-	/// leave the backing file as-is on the disk (not recommended for non pod types)
-	Persist,
 	#[default]
 	/// delete the backing file (default behavior)
 	Delete,
+	/// leave the backing file as-is on the disk (not recommended for non pod types)
+	Persist,
 	/// serialize the data for safe storage of non pod types, optionally with a separate path for the storage. Requires the file vec have serialization enabled, such as through filevec.enable_serialization(), which in turn requires a serial feature
 	Serialize(Option<PathBuf>)
 }
@@ -760,53 +816,13 @@ pub struct SerialJson{pretty:bool}
 pub struct SerialRMP;
 
 #[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
-mod serial_adapters{
-	#[cfg(feature="serial-json")]
-	impl SerialJson{
-		/// create a new serialization behavior that uses serde-json
-		pub fn new(pretty:bool)->Self{
-			Self{pretty}
-		}
-	}
-	#[cfg(feature="serial-rmp")]
-	impl SerialRMP{
-		/// create a new serialization behavior that uses rmp-serde
-		pub fn new()->Self{Self}
-	}
-	#[cfg(feature="serial-json")]
-	impl<E:DeserializeOwned+Serialize,R:Read,W:Write> SerialBehavior<E,R,W> for SerialJson{
-		fn load(&self        ,reader:&mut R)->IOResult<E >{
-			use std::io::ErrorKind as IOErrorKind;
-			//Ok(json_decode::from_reader(&mut *reader)?)
-
-			let mut e=serde_json::Deserializer::from_reader(reader).into_iter::<E>();
-			e.next().ok_or_else(||IOError::new(IOErrorKind::UnexpectedEof,"stream should have data at this point but no items are found")).and_then(|e|Ok(e?))
-		}
-		fn save(&self,data:&E,writer:&mut W)->IOResult<()>{
-			if self.pretty{json_encode::to_writer_pretty(&mut *writer,data)?}else{json_encode::to_writer(&mut *writer,data)?}
-			writeln!(writer)
-		}
-	}
-	#[cfg(feature="serial-rmp")]
-	impl<E:DeserializeOwned+Serialize,R:Read,W:Write> SerialBehavior<E,R,W> for SerialRMP{
-		fn load(&self         ,reader:&mut R)->IOResult<E >{Ok(rmp_decode::from_read(reader       ).map_err(IOError::other)?)}
-		fn save(&self,data:& E,writer:&mut W)->IOResult<()>{Ok(rmp_encode::write(&mut *writer,data).map_err(IOError::other)?)}
-	}
-	impl<E,R,W> SerialBehavior<E,R,W> for Arc<dyn SerialBehavior<E,R,W>>{
-		fn load(&self        ,reader:&mut R)->IOResult< E>{(**self).load(     reader)}
-		fn save(&self,data:&E,writer:&mut W)->IOResult<()>{(**self).save(data,writer)}
-	}
-	/// serialization behavior to apply when enabling serialization
-	pub trait SerialBehavior<E,R,W>:Debug+Send+Sync{
-		/// deserialization behavior to apply when loading
-		fn load(&self        ,reader:&mut R)->IOResult<E >;
-		/// serialization behavior to apply when saving
-		fn save(&self,data:&E,writer:&mut W)->IOResult<()>;
-	}
-	use super::*;
+/// serialization behavior to apply when enabling serialization
+pub trait SerialBehavior<E,R,W>:Debug+Send+Sync{
+	/// deserialization behavior to apply when loading
+	fn load(&self        ,reader:&mut R)->IOResult<E >;
+	/// serialization behavior to apply when saving
+	fn save(&self,data:&E,writer:&mut W)->IOResult<()>;
 }
-#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]
-pub use serial_adapters::SerialBehavior;
 
 use crate::{
 	FinalizeDrop,iter::{Drain,ExtractIf}

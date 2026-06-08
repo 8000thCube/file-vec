@@ -29,12 +29,9 @@ mod tests{
 			data.serialize_on_close(crate::vec::SerialJson::new(false));
 
 			mem::drop(data);
-			let mut datanew:FileVec<Record>=FileVec::new();
 
-			datanew.serialize_on_close(crate::vec::SerialJson::new(false));
+			let mut datanew:FileVec<Record>=FileVec::open_serial(datapath,crate::vec::SerialJson::new(false)).unwrap();
 			datanew.set_persistent(false);
-
-			datanew.load(datapath).unwrap();
 
 			assert_eq!(datamem.as_slice(),datanew.as_slice());
 		}
@@ -52,15 +49,12 @@ mod tests{
 			let datamem:Vec<Record>=data.to_vec();
 
 			data.serialize_on_close(crate::vec::SerialJson::new(false));
-			data.set_close_behavior(OnClose::serialize("another path"));
+			data.set_close_behavior(OnClose::serialize_to("another path"));
 
 			mem::drop(data);
-			let mut datanew:FileVec<Record>=FileVec::new();
 
-			datanew.serialize_on_close(crate::vec::SerialJson::new(false));
+			let mut datanew:FileVec<Record>=FileVec::open_serial("another path",crate::vec::SerialJson::new(false)).unwrap();
 			datanew.set_persistent(false);
-
-			datanew.load("another path").unwrap();
 
 			assert_eq!(datamem.as_slice(),datanew.as_slice());
 		}
@@ -93,10 +87,8 @@ mod tests{
 
 			mem::drop(data);
 
-			let mut datanew:FileVec<Record>=FileVec::new();
-			datanew.enable_serialization();
-
-			datanew.load(datapath).unwrap();
+			let mut datanew:FileVec<Record>=FileVec::open_serial(datapath,crate::vec::SerialJson::new(false)).unwrap();
+			datanew.set_persistent(false);
 
 			assert_eq!(datamem.as_slice(),datanew.as_slice());
 		}
