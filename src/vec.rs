@@ -76,18 +76,6 @@ impl<E,const N:usize> FileVec<[E;N]>{
 		self.close();
 		let mut result=unsafe{FileVec::open(path).unwrap()};
 
-		/*#[cfg(any(feature="serial-custom",feature="serial-json",feature="serial-rmp"))]{
-			result.serialbehavior=self.serialbehavior.take().map(|b|unsafe{
-				let b:ComponentSB<Arc<dyn SerialBehavior<[E;N],BufReader<File>,BufWriter<File>>>,N>=ComponentSB(b);
-				let a:Arc<dyn SerialBehavior<E,BufReader<File>,BufWriter<File>>>=Arc::new(b);
-						// serial behavior is only some if static
-				let p:*const  dyn         SerialBehavior<E,BufReader<File>,BufWriter<File>> =Arc::into_raw(a);
-				let p:*const (dyn 'static+SerialBehavior<E,BufReader<File>,BufWriter<File>>)=mem::transmute_copy(&p);
-
-				Arc::from_raw(p)
-			});
-		}*/
-
 		result.closebehavior=closebehavior;
 		result
 	}
